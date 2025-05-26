@@ -1,94 +1,78 @@
-# app/main.py
+from fastapi import FastAPI, HTTPException, Request
+import httpx
+from pydantic import BaseModel
+import base64
+import os
 
-from fastapi import FastAPI, BackgroundTasks, HTTPException, Request, status
-from fastapi.responses import JSONResponse
-from pydantic import BaseModel, EmailStr
-from .settings import settings
-from .clients import notion_update, zapsign_create, NOTION_HEADERS
-import requests
-import logging
+app = FastAPI()
 
-log = logging.getLogger("uvicorn.error")
+# Configurações (use variáveis de ambiente)
+NOTION_TOKEN = os.getenv("NOTION_TOKEN")
+ZAPSIGN_TOKEN = os.getenv("ZAPSIGN_TOKEN")
 
-class SendDocPayload(BaseModel):
+class NotionPayload(BaseModel):
     page_id: str
-    nome: str
-    email: EmailStr
-    proposta_pdf: dict
+    email: str
+    whatsapp: str
 
-class ZapSignWebhookPayload(BaseModel):
-    event: str
-    doc_token: str
-
-# Crie a instância do FastAPI com o nome 'app'
-app = FastAPI(title="Notion ↔ ZapSign Integration")
-
-@app.post("/senddoc", response_model=dict)
-async def send_doc(payload: SendDocPayload, bg: BackgroundTasks):
-    """
-    Recebe JSON via botão do Notion, envia o PDF à ZapSign
-    e atualiza Status Assinatura → Enviado no Notion.
-    """
+@app.post("/senddoc")
+async def send_doc(request: Request, payload: NotionPayload):
     try:
-        files = payload.proposta_pdf.get("files", [])
-        pdf_url = files[0]["file"]["url"]
-    except (IndexError, KeyError, TypeError):
-        log.error("Estrutura inválida em proposta_pdf: %r", payload.proposta_pdf)
+        # 1. Buscar a página no Notion para obter o PDF
+        async with httpx.AsyncClient() as client:
+            notion_response = await client.get(
+                f"https://api.notion.com/v1/pages/{payload.page_id}",
+                headers={
+                    "Authorization": f"Bearer {NOTION_TOKEN}",
+                    "Notion-Version": "2022-06-28"
+                }
+            )
+            notion_response.raise_for_status()
+            notion_data = notion_response.json()
+
+            # 2. Extrair URL do PDF da propriedade "Proposta PDF"
+            proposta_pdf = notion_data["properties"]["Proposta PDF"]["files"][0]
+            pdf_url = proposta_pdf["external"]["url"]
+
+            # 3. Baixar o PDF (opcional, se ZapSign não aceitar URLs temporárias)
+            pdf_response = await client.get(pdf_url)
+            pdf_content = base64.b64encode(pdf_response.content).decode("utf-8")
+
+            # 4. Enviar para o ZapSign
+            zap_sign_payload = {
+                "name": "Contrato de Seguro",  # Substitua por um campo dinâmico se necessário
+                "email": payload.email,
+                "phone": f"+{payload.whatsapp}",
+                "doc_content": pdf_content,  # Ou use "doc_url": pdf_url se preferir
+                "doc_name": "contrato.pdf",
+                "signers": [{
+                    "name": "Cliente",
+                    "email": payload.email,
+                    "phone": f"+{payload.whatsapp}"
+                }]
+            }
+
+            zap_sign_response = await client.post(
+                "https://api.zapsign.com.br/docs",
+                json=zap_sign_payload,
+                headers={
+                    "Content-Type": "application/json",
+                    "Authorization": f"Bearer {ZAPSIGN_TOKEN}"
+                }
+            )
+            zap_sign_response.raise_for_status()
+
+        return {"success": True, "data": zap_sign_response.json()}
+
+    except httpx.HTTPStatusError as e:
         raise HTTPException(
-            status.HTTP_400_BAD_REQUEST,
-            "Campo 'proposta_pdf' mal formatado ou vazio.",
+            status_code=422,
+            detail=f"Erro ao processar documento: {e.response.text}"
         )
-
-    try:
-        doc_token = zapsign_create(
-            payload.nome, pdf_url, payload.nome, payload.email
-        )
-    except Exception as exc:
-        log.exception("Erro ao criar doc na ZapSign")
+    except Exception as e:
         raise HTTPException(
-            status.HTTP_502_BAD_GATEWAY,
-            "Falha ao comunicar com a ZapSign.",
+            status_code=500,
+            detail=f"Erro interno: {str(e)}"
         )
 
-    bg.add_task(notion_update, payload.page_id, "Enviado", doc_token)
-    return {"ok": True, "doc_token": doc_token}
-
-@app.post("/zapsign/webhook", status_code=200)
-async def zapsign_webhook(req: Request):
-    """
-    Recebe webhooks da ZapSign e atualiza o Notion.
-    """
-    try:
-        body = await req.json()
-        payload = ZapSignWebhookPayload(**body)
-    except Exception:
-        log.error("Webhook ZapSign payload inválido: %r", await req.body())
-        raise HTTPException(
-            status.HTTP_400_BAD_REQUEST,
-            "JSON de webhook inválido.",
-        )
-
-    if payload.event != "document_signed":
-        return JSONResponse(status_code=200, content={"ignored": True})
-
-    query = {
-        "filter": {
-            "property": "Doc Token",
-            "rich_text": {"contains": payload.doc_token},
-        }
-    }
-    res = requests.post(
-        f"https://api.notion.com/v1/databases/{settings.notion_db_id}/query",
-        headers=NOTION_HEADERS,
-        json=query,
-        timeout=10,
-    ).json()
-
-    results = res.get("results") or []
-    if not results:
-        log.warning("Doc Token não encontrado no Notion: %s", payload.doc_token)
-        raise HTTPException(status.HTTP_404_NOT_FOUND, "Página não encontrada")
-
-    page_id = results[0]["id"]
-    notion_update(page_id, "Assinado")
-    return {"ok": True}
+# Para rodar: uvicorn main:app --reload
