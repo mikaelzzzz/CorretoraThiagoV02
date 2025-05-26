@@ -51,15 +51,29 @@ class Signer(BaseModel):
         return cleaned
 
 @app.post("/create-document", response_model=dict)
-async def create_document(payload: NotionPayload):
+async def create_document(request: Request):
     """
-    Cria documento no ZapSign a partir de dados do Notion
+    Cria documento no ZapSign a partir de evento do Notion
     """
+    # 1. Extrair e validar dados do webhook do Notion
     try:
-        logger.info(f"[DEBUG] Payload recebido: {payload.dict(by_alias=True)}")
+        event = await request.json()
+        props = event['data']['properties']
+        clean = {
+            'Page ID':         props['Page ID']['formula']['string'],
+            'WhatsApp':        props['WhatsApp']['rich_text'][0]['plain_text'],
+            'Nome do Cliente': props['Nome do Cliente']['title'][0]['plain_text'],
+            'Email':           props['Email']['email'],
+        }
+        payload = NotionPayload.model_validate(clean)
+        logger.info(f"[DEBUG] Payload construído: {payload.dict(by_alias=True)}")
+    except Exception as e:
+        logger.error(f"Erro ao extrair dados do Notion: {e}")
+        raise HTTPException(status_code=422, detail=f"Erro ao extrair dados: {e}")
 
+    try:
         async with httpx.AsyncClient(timeout=settings.http_timeout_seconds) as client:
-            # 1. Buscar dados do Notion
+            # 2. Buscar dados do Notion (para obter URL do PDF)
             try:
                 notion_response = await client.get(
                     f"{settings.notion_base_url}/pages/{payload.page_id}",
@@ -74,7 +88,7 @@ async def create_document(payload: NotionPayload):
                 logger.error(f"Falha na Notion API: {e.response.text}")
                 raise HTTPException(status_code=502, detail=f"Falha no Notion: {e.response.text}")
 
-            # 2. Processar PDF
+            # 3. Processar PDF
             try:
                 proposta_pdf = notion_data['properties']['Proposta PDF']['files'][0]
                 pdf_url = (
@@ -95,7 +109,7 @@ async def create_document(payload: NotionPayload):
                 logger.error(f"Erro ao processar PDF: {e}")
                 raise HTTPException(status_code=422, detail=f"Erro no PDF: {e}")
 
-            # 3. Integração com ZapSign
+            # 4. Integração com ZapSign
             try:
                 signer = Signer(
                     name=payload.client_name,
