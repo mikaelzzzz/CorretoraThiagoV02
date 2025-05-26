@@ -3,7 +3,9 @@
 import re
 import base64
 import logging
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, HTTPException, Request
+from fastapi.exceptions import RequestValidationError
+from fastapi.responses import JSONResponse
 from pydantic import BaseModel, field_validator
 from app.schemas.notion import NotionPayload
 from app.settings import settings
@@ -16,9 +18,19 @@ app = FastAPI(title="Corretora 3.0 API", version="1.0.0")
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
-# Carrega tokens diretamente do settings
+# Tokens carregados do settings
 NOTION_TOKEN = settings.notion_token.get_secret_value()
 ZAPSIGN_TOKEN = settings.zapsign_token.get_secret_value()
+
+# Tratamento de erros de validação para logar o corpo da requisição
+@app.exception_handler(RequestValidationError)
+async def validation_exception_handler(request: Request, exc: RequestValidationError):
+    body = await request.body()
+    logger.error(f"ValidationError: errors={exc.errors()}, body={body.decode('utf-8')}")
+    return JSONResponse(
+        status_code=422,
+        content={"detail": exc.errors(), "body": body.decode('utf-8')}
+    )
 
 class Signer(BaseModel):
     name: str
@@ -31,12 +43,9 @@ class Signer(BaseModel):
 
     @field_validator('phone_number', mode='before')
     def validate_phone_number(cls, v: str) -> str:
-        # Remove tudo que não for dígito
         cleaned = re.sub(r"\D", "", v)
-        # Deve ter 11 (DDD+9 dígitos) ou 13 (c/ código país) dígitos
         if len(cleaned) not in (11, 13):
             raise ValueError("Número deve ter 11 (DDD+9 dígitos) ou 13 dígitos (com código país)")
-        # Adiciona código do país se faltar
         if not cleaned.startswith('55'):
             cleaned = '55' + cleaned
         return cleaned
@@ -52,7 +61,6 @@ async def create_document(payload: NotionPayload):
         async with httpx.AsyncClient(timeout=settings.http_timeout_seconds) as client:
             # 1. Buscar dados do Notion
             try:
-                logger.info(f"Buscando página {payload.page_id} no Notion")
                 notion_response = await client.get(
                     f"{settings.notion_base_url}/pages/{payload.page_id}",
                     headers={
