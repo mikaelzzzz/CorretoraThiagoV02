@@ -1,28 +1,16 @@
 import re
 from pydantic import BaseModel, Field, ConfigDict, field_validator
-from app.settings import settings
 
 class NotionPayload(BaseModel):
-    page_id: str = Field(
-        ...,
-        alias=settings.notion_property_mappings["page_id"]
-    )
-    whatsapp: str = Field(
-        ...,
-        alias=settings.notion_property_mappings["whatsapp"]
-    )
-    client_name: str = Field(
-        ...,
-        alias=settings.notion_property_mappings["client_name"]
-    )
-    email: str = Field(
-        ...,
-        alias=settings.notion_property_mappings["email"]
-    )
+    # Propriedades exatas do Notion, sem usar um dicionário de alias
+    page_id: str = Field(..., alias="Page ID")
+    whatsapp: str = Field(..., alias="WhatsApp")
+    client_name: str = Field(..., alias="Nome do Cliente")
+    email: str = Field(..., alias="Email")
 
     @field_validator("whatsapp", mode="before")
     def validate_whatsapp(cls, v: str) -> str:
-        # Remove tudo que não é dígito
+        # Remove tudo que não for dígito
         cleaned = re.sub(r"\D", "", v)
         # Valida comprimento (10-13 dígitos)
         if len(cleaned) not in (10, 11, 12, 13):
@@ -32,7 +20,7 @@ class NotionPayload(BaseModel):
             cleaned = f"55{cleaned}"
         return cleaned
 
-    # Configuração Pydantic v2
+    # Configuração Pydantic v2 para suportar aliases e ignorar campos extras
     model_config = ConfigDict(
         populate_by_name=True,
         extra="ignore"
