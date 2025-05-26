@@ -1,5 +1,6 @@
 from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel, validator, constr
+from app.schemas.notion import NotionPayload
 import httpx
 import base64
 import os
