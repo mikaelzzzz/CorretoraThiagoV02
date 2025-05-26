@@ -4,10 +4,16 @@ import httpx
 import base64
 import os
 from typing import Optional
+import logging
 
-app = FastAPI()
+# Configuração inicial do app
+app = FastAPI(title="Corretora 3.0 API", version="1.0.0")
 
-# Configurações
+# Configuração de logging
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
+
+# Variáveis de ambiente
 NOTION_TOKEN = os.getenv("NOTION_TOKEN")
 ZAPSIGN_TOKEN = os.getenv("ZAPSIGN_TOKEN")
 
@@ -42,104 +48,137 @@ class NotionPayload(BaseModel):
         
         return cleaned
 
-@app.post("/create-document")
+@app.post("/create-document", response_model=dict)
 async def create_document(payload: NotionPayload):
+    """
+    Cria documento no ZapSign a partir de dados do Notion
+    
+    - **page_id**: ID da página no Notion
+    - **email**: Email do cliente
+    - **whatsapp**: Número do WhatsApp (apenas dígitos)
+    - **client_name**: Nome completo do cliente
+    """
     try:
-        print(f"\n[DEBUG] Iniciando processo para página: {payload.page_id}")
-        print(f"[DEBUG] Dados recebidos: {payload.dict()}")
-
-        async with httpx.AsyncClient() as client:
+        logger.info(f"Iniciando processo para página: {payload.page_id}")
+        
+        async with httpx.AsyncClient(timeout=30) as client:
             # 1. Buscar dados do Notion
-            print("\n[DEBUG] Buscando dados do Notion...")
-            notion_response = await client.get(
-                f"https://api.notion.com/v1/pages/{payload.page_id}",
-                headers={
-                    "Authorization": f"Bearer {NOTION_TOKEN}",
-                    "Notion-Version": "2022-06-28"
-                }
-            )
-            notion_response.raise_for_status()
-            notion_data = notion_response.json()
-            print("[DEBUG] Dados do Notion recebidos com sucesso")
+            try:
+                notion_response = await client.get(
+                    f"https://api.notion.com/v1/pages/{payload.page_id}",
+                    headers={
+                        "Authorization": f"Bearer {NOTION_TOKEN}",
+                        "Notion-Version": "2022-06-28"
+                    }
+                )
+                notion_response.raise_for_status()
+                notion_data = notion_response.json()
+            except httpx.HTTPStatusError as e:
+                logger.error(f"Erro no Notion: {e.response.text}")
+                raise HTTPException(
+                    status_code=502,
+                    detail="Falha na comunicação com o Notion"
+                )
 
             # 2. Processar PDF
-            print("\n[DEBUG] Processando PDF...")
-            proposta_pdf = notion_data["properties"]["Proposta PDF"]["files"][0]
-            print(f"[DEBUG] Estrutura do PDF: {proposta_pdf.keys()}")
+            try:
+                proposta_pdf = notion_data["properties"]["Proposta PDF"]["files"][0]
+                pdf_url = (
+                    proposta_pdf["external"]["url"] 
+                    if "external" in proposta_pdf 
+                    else proposta_pdf["file"]["url"]
+                )
+                
+                # Validar URL
+                if not pdf_url.startswith("http"):
+                    raise ValueError("URL do PDF inválida")
 
-            # Extrair URL do PDF
-            if "external" in proposta_pdf:
-                pdf_url = proposta_pdf["external"]["url"]
-            elif "file" in proposta_pdf:
-                pdf_url = proposta_pdf["file"]["url"]
-            else:
-                raise ValueError("Formato de arquivo não suportado pelo Notion")
+                pdf_response = await client.get(pdf_url)
+                pdf_response.raise_for_status()
+                
+                # Validar PDF
+                if not pdf_response.content.startswith(b'%PDF-'):
+                    raise ValueError("Arquivo não é um PDF válido")
 
-            print(f"[DEBUG] URL do PDF: {pdf_url}")
+                pdf_content = base64.b64encode(pdf_response.content).decode("utf-8")
+                
+            except (KeyError, ValueError) as e:
+                logger.error(f"Erro no PDF: {str(e)}")
+                raise HTTPException(
+                    status_code=422,
+                    detail="Arquivo PDF inválido ou não encontrado"
+                )
 
-            # Baixar e converter para base64
-            pdf_response = await client.get(pdf_url)
-            pdf_content = base64.b64encode(pdf_response.content).decode("utf-8")
-            print("[DEBUG] PDF convertido para base64")
+            # 3. Preparar e enviar para ZapSign
+            try:
+                signers = [Signer(
+                    name=payload.client_name,
+                    email=payload.email,
+                    phone_number=payload.whatsapp[-11:]
+                ).dict()]
 
-            # 3. Preparar signatário
-            print("\n[DEBUG] Criando payload para ZapSign...")
-            signers = [Signer(
-                name=payload.client_name,
-                email=payload.email,
-                phone_number=payload.whatsapp[-11:]  # Mantém últimos 11 dígitos
-            ).dict()]
-
-            # 4. Criar documento no ZapSign
-            zap_sign_payload = {
-                "name": f"Contrato {payload.client_name}",
-                "base64_pdf": pdf_content,
-                "lang": "pt-br",
-                "signers": signers,
-                "brand_name": "Corretora 3.0",
-                "metadata": [{"key": "notion_page_id", "value": payload.page_id}]
-            }
-
-            print(f"[DEBUG] Payload ZapSign: {zap_sign_payload}")
-
-            response = await client.post(
-                "https://api.zapsign.com.br/api/v1/docs",
-                json=zap_sign_payload,
-                headers={
-                    "Authorization": f"Bearer {ZAPSIGN_TOKEN}",
-                    "Content-Type": "application/json"
+                response = await client.post(
+                    "https://api.zapsign.com.br/api/v1/docs",
+                    json={
+                        "name": f"Contrato {payload.client_name}",
+                        "base64_pdf": pdf_content,
+                        "lang": "pt-br",
+                        "signers": signers,
+                        "brand_name": "Corretora 3.0",
+                        "metadata": [{"key": "notion_page_id", "value": payload.page_id}]
+                    },
+                    headers={
+                        "Authorization": f"Bearer {ZAPSIGN_TOKEN}",
+                        "Content-Type": "application/json"
+                    }
+                )
+                response.raise_for_status()
+                response_data = response.json()
+                
+                return {
+                    "status": "success",
+                    "document_id": response_data["open_id"],
+                    "sign_url": response_data["signers"][0]["sign_url"]
                 }
-            )
-            response.raise_for_status()
-            print("\n[DEBUG] Documento criado com sucesso no ZapSign")
+                
+            except httpx.HTTPStatusError as e:
+                logger.error(f"Erro no ZapSign: {e.response.text}")
+                raise HTTPException(
+                    status_code=502,
+                    detail="Falha na comunicação com o ZapSign"
+                )
 
-            return {
-                "status": "success",
-                "document_id": response.json()["open_id"],
-                "sign_url": response.json()["signers"][0]["sign_url"]
-            }
-
-    except httpx.HTTPStatusError as e:
-        error_detail = f"Erro na API externa: {e.response.status_code} - {e.response.text}"
-        print(f"\n[ERRO] {error_detail}")
-        raise HTTPException(status_code=500, detail=error_detail)
-    
-    except KeyError as e:
-        error_detail = f"Campo não encontrado no Notion: {str(e)}"
-        print(f"\n[ERRO] {error_detail}")
-        raise HTTPException(
-            status_code=422,
-            detail=error_detail
-        )
-    
     except Exception as e:
-        error_detail = f"Erro interno: {str(e)}"
-        print(f"\n[ERRO] {error_detail}")
+        logger.error(f"Erro inesperado: {str(e)}", exc_info=True)
         raise HTTPException(
             status_code=500,
-            detail=error_detail
+            detail="Erro interno no processamento"
         )
 
 if __name__ == "__main__":
     import uvicorn
-    uvicorn.run(app, host="0.0.0.0", port=8000)
+    uvicorn.run(
+        app, 
+        host="0.0.0.0", 
+        port=8000,
+        log_config={
+            "version": 1,
+            "disable_existing_loggers": False,
+            "handlers": {
+                "console": {
+                    "class": "logging.StreamHandler",
+                    "stream": "ext://sys.stdout",
+                    "formatter": "default",
+                },
+            },
+            "formatters": {
+                "default": {
+                    "format": "%(asctime)s - %(name)s - %(levelname)s - %(message)s"
+                },
+            },
+            "root": {
+                "level": "INFO",
+                "handlers": ["console"]
+            }
+        }
+    )
