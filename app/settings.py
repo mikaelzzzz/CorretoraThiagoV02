@@ -1,6 +1,8 @@
 # app/settings.py
 from pydantic_settings import BaseSettings, SettingsConfigDict
 from pydantic import SecretStr
+from app.settings import settings
+
 
 class Settings(BaseSettings):
     # Notion
