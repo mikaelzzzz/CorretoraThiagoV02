@@ -27,12 +27,6 @@ class Signer(BaseModel):
     send_automatic_email: bool = True
     send_automatic_whatsapp: bool = True
 
-class NotionPayload(BaseModel):
-    page_id: str
-    email: str
-    whatsapp: constr(min_length=11, max_length=13)
-    client_name: str
-
     @validator('whatsapp')
     def validate_whatsapp(cls, v):
         cleaned = v.strip() \
