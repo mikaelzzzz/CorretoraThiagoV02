@@ -22,7 +22,7 @@ logger = logging.getLogger(__name__)
 NOTION_TOKEN = settings.notion_token.get_secret_value()
 ZAPSIGN_TOKEN = settings.zapsign_token.get_secret_value()
 
-# Handler para erros de validação e log do raw body
+# Handler para erros de validação e log do corpo da requisição
 @app.exception_handler(RequestValidationError)
 async def validation_exception_handler(request: Request, exc: RequestValidationError):
     body = await request.body()
@@ -53,7 +53,7 @@ class Signer(BaseModel):
 @app.post("/create-document", response_model=dict)
 async def create_document(request: Request):
     """
-    Cria documento no ZapSign e atualiza status no Notion
+    Cria documento no ZapSign e atualiza status no Notion para 'Enviado'
     """
     # 1. Extrair e validar dados do webhook do Notion
     try:
@@ -71,45 +71,40 @@ async def create_document(request: Request):
         logger.error(f"Erro ao extrair dados do Notion: {e}")
         raise HTTPException(status_code=422, detail=f"Erro ao extrair dados: {e}")
 
-    # 2. Inicializa cliente HTTP
     async with httpx.AsyncClient(timeout=settings.http_timeout_seconds) as client:
-        # 3. Fetch Notion page to get PDF URL
+        # 2. Buscar URL do PDF
         try:
-            notion_response = await client.get(
+            notion_resp = await client.get(
                 f"{settings.notion_base_url}/pages/{payload.page_id}",
                 headers={
                     'Authorization': f"Bearer {NOTION_TOKEN}",
                     'Notion-Version': settings.notion_api_version,
                 }
             )
-            notion_response.raise_for_status()
-            notion_data = notion_response.json()
+            notion_resp.raise_for_status()
+            notion_data = notion_resp.json()
         except httpx.HTTPStatusError as e:
-            logger.error(f"Falha na Notion API: {e.response.text}")
-            raise HTTPException(status_code=502, detail=f"Falha no Notion: {e.response.text}")
+            logger.error(f"Falha Notion API: {e.response.text}")
+            raise HTTPException(502, f"Falha no Notion: {e.response.text}")
 
-        # 4. Processar PDF
+        # 3. Processar PDF
         try:
-            proposta_pdf = notion_data['properties']['Proposta PDF']['files'][0]
-            pdf_url = (
-                proposta_pdf.get('external', {}).get('url')
-                or proposta_pdf.get('file', {}).get('url')
-            )
+            files = notion_data['properties']['Proposta PDF']['files']
+            file_item = files[0]
+            pdf_url = file_item.get('external', {}).get('url') or file_item.get('file', {}).get('url')
             if not pdf_url or not pdf_url.startswith('http'):
                 raise ValueError("URL do PDF inválida")
-
-            pdf_response = await client.get(pdf_url)
-            pdf_response.raise_for_status()
-            content = pdf_response.content
+            pdf_resp = await client.get(pdf_url)
+            pdf_resp.raise_for_status()
+            content = pdf_resp.content
             if not content or b'%PDF' not in content[:8]:
                 raise ValueError("Conteúdo não parece ser um PDF válido")
+            pdf_b64 = base64.b64encode(content).decode('utf-8')
+        except Exception as e:
+            logger.error(f"Erro no PDF: {e}")
+            raise HTTPException(422, f"Erro no PDF: {e}")
 
-            pdf_content = base64.b64encode(content).decode('utf-8')
-        except (KeyError, ValueError) as e:
-            logger.error(f"Erro ao processar PDF: {e}")
-            raise HTTPException(status_code=422, detail=f"Erro no PDF: {e}")
-
-        # 5. Enviar para ZapSign
+        # 4. Envia para ZapSign
         try:
             signer = Signer(
                 name=payload.client_name,
@@ -118,54 +113,68 @@ async def create_document(request: Request):
             )
             zap_payload = {
                 'name': f"Contrato {payload.client_name}",
-                'base64_pdf': pdf_content,
+                'base64_pdf': pdf_b64,
                 'lang': 'pt-br',
                 'signers': [signer.dict()],
-                'metadata': [
-                    {'key': 'notion_page_id', 'value': payload.page_id},
-                    {'key': 'client_email', 'value': payload.email}
-                ],
+                'metadata': [ {'key': 'notion_page_id', 'value': payload.page_id} ]
             }
             zap_resp = await client.post(
                 f"{settings.zapsign_base_url}/docs",
                 json=zap_payload,
-                headers={
-                    'Authorization': f"Bearer {ZAPSIGN_TOKEN}",
-                    'Content-Type': 'application/json'
-                }
+                headers={ 'Authorization': f"Bearer {ZAPSIGN_TOKEN}", 'Content-Type': 'application/json' }
             )
             zap_resp.raise_for_status()
             zap_data = zap_resp.json()
         except httpx.HTTPStatusError as e:
-            logger.error(f"Erro na ZapSign: {e.response.text}")
-            raise HTTPException(status_code=502, detail=f"Erro ZapSign: {e.response.text}")
+            logger.error(f"Erro ZapSign: {e.response.text}")
+            raise HTTPException(502, f"Erro ZapSign: {e.response.text}")
 
-        # 6. Atualizar status no Notion para 'Enviado'
+        # 5. Atualiza status para 'Enviado'
         try:
-            update_payload = {
-                'properties': {
-                    'Status Assinatura': {
-                        'select': { 'name': 'Enviado' }
-                    }
-                }
-            }
-            update_resp = await client.patch(
+            patch_payload = { 'properties': { 'Status Assinatura': { 'select': {'name':'Enviado'} } } }
+            upd = await client.patch(
                 f"{settings.notion_base_url}/pages/{payload.page_id}",
-                json=update_payload,
+                json=patch_payload,
                 headers={
                     'Authorization': f"Bearer {NOTION_TOKEN}",
                     'Notion-Version': settings.notion_api_version,
                     'Content-Type': 'application/json'
                 }
             )
-            update_resp.raise_for_status()
-        except httpx.HTTPStatusError as e:
-            logger.error(f"Falha ao atualizar Notion: {e.response.text}")
-            # Não falha o fluxo, mas loga
+            upd.raise_for_status()
+        except Exception:
+            logger.error("Falha ao atualizar status para Enviado no Notion")
 
-    # 7. Retornar resposta
-    return {
-        'status': 'success',
-        'document_id': zap_data['open_id'],
-        'sign_url': zap_data['signers'][0]['sign_url']
-    }
+    return { 'status':'success', 'document_id': zap_data['open_id'], 'sign_url': zap_data['signers'][0]['sign_url'] }
+
+@app.post("/zapsign-webhook")
+async def zapsign_webhook(request: Request):
+    """
+    Recebe webhook do ZapSign e atualiza Notion para 'Assinado'
+    """
+    data = await request.json()
+    # Extrai page_id do metadata
+    metadata = data.get('metadata', [])
+    page_id = next((m['value'] for m in metadata if m.get('key')=='notion_page_id'), None)
+    if not page_id:
+        logger.error("Webhook ZapSign sem metadata notion_page_id")
+        return JSONResponse(status_code=400, content={"detail":"Missing notion_page_id"})
+
+    # Atualiza status no Notion
+    async with httpx.AsyncClient(timeout=settings.http_timeout_seconds) as client:
+        try:
+            patch = { 'properties': { 'Status Assinatura': { 'select': {'name':'Assinado'} } } }
+            resp = await client.patch(
+                f"{settings.notion_base_url}/pages/{page_id}",
+                json=patch,
+                headers={
+                    'Authorization': f"Bearer {NOTION_TOKEN}",
+                    'Notion-Version': settings.notion_api_version,
+                    'Content-Type': 'application/json'
+                }
+            )
+            resp.raise_for_status()
+            return {"status":"updated"}
+        except httpx.HTTPStatusError as e:
+            logger.error(f"Erro ao atualizar para Assinado: {e.response.text}")
+            raise HTTPException(status_code=502, detail=f"Falha Notion update: {e.response.text}")
