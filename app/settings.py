@@ -9,7 +9,7 @@ class Settings(BaseSettings):
     notion_property_mappings: dict = {  # 👈 Adicione esta linha
         "page_id": "Page ID",
         "whatsapp": "WhatsApp",
-        "client_name": "Nome do Cliente",
+        "client_name": "Client Name",
         "email": "Email"
     }
 
